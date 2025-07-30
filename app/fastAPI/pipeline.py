@@ -14,6 +14,7 @@ from sentence_transformers import SentenceTransformer
 from langchain_community.vectorstores import FAISS
 from langchain.embeddings.base import Embeddings
 import tiktoken
+from urllib.parse import urlparse
 
 # --- Config ---
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -38,7 +39,9 @@ def download_file(
             response = requests.get(url, stream=True, timeout=timeout)
             response.raise_for_status()
 
-            suffix = os.path.splitext(url)[1]
+            parsed = urlparse(url)
+            suffix = os.path.splitext(parsed.path)[1]  # Only file extension
+
             fd, temp_path = tempfile.mkstemp(suffix=suffix)
             with os.fdopen(fd, "wb") as tmp:
                 for chunk in response.iter_content(chunk_size=65536):
@@ -53,12 +56,9 @@ def download_file(
                 raise RuntimeError(
                     f"Failed to download file after {retries} attempts: {e}"
                 )
-            time.sleep(1)  # Wait before retrying
-
+            time.sleep(1)
 
 # 2. Enhanced Document Parsing
-
-
 # Using PyMuPDF for faster PDF extraction
 def extract_pdf_text_pymupdf(path: str) -> List[str]:
     """Extract text from PDF using PyMuPDF (faster than pdfplumber)"""
