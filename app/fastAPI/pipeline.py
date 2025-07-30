@@ -6,6 +6,7 @@ import mimetypes
 import tempfile
 import time
 import concurrent.futures
+import hashlib
 from typing import List, Optional, Tuple, Dict, Any, Generator
 from dataclasses import dataclass
 import numpy as np
@@ -15,6 +16,7 @@ from langchain_community.vectorstores import FAISS
 from langchain.embeddings.base import Embeddings
 import tiktoken
 from urllib.parse import urlparse
+import torch
 
 # --- Config ---
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -23,9 +25,16 @@ MAX_WORKERS = 4  # For parallel processing
 MAX_TOKENS_PER_CHUNK = 512  # For token efficiency
 CHUNK_OVERLAP = 100  # For sliding window
 BATCH_SIZE = 32  # For embedding generation
+CACHE_DIR = "document_cache"  # Directory to cache document indexes
+NUM_RELEVANT_CHUNKS = 5  # Number of chunks to retrieve per question
+OLLAMA_API_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3.1:8b"
 
 # Initialize tokenizer for token counting
 tokenizer = tiktoken.get_encoding("cl100k_base")  # GPT-4 tokenizer
+
+# Ensure cache directory exists
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 
 # 1. Document Download with timeout and retry
@@ -57,6 +66,7 @@ def download_file(
                     f"Failed to download file after {retries} attempts: {e}"
                 )
             time.sleep(1)
+
 
 # 2. Enhanced Document Parsing
 # Using PyMuPDF for faster PDF extraction
@@ -529,21 +539,50 @@ def save_faiss_index(db: FAISS, faiss_index_path: str):
         shutil.rmtree(backup_path)
 
 
+# UPDATED: Robust FAISS index loading with meta tensor error handling
 def load_faiss_index(
     faiss_index_path: str = FAISS_INDEX_PATH, model_name: str = EMBEDDING_MODEL
 ):
-    """Load FAISS index from disk"""
-    model = SentenceTransformer(model_name)
-    provider = CustomSentenceTransformerEmbeddings(model)
+    """Load FAISS index from disk with robust error handling for meta tensor issues"""
+    try:
+        # Force CPU mode to avoid meta tensor issues
+        device = "cpu"
+        model = SentenceTransformer(model_name, device=device)
+        provider = CustomSentenceTransformerEmbeddings(model)
 
-    if os.path.exists(faiss_index_path):
-        # Added allow_dangerous_deserialization=True parameter
-        return FAISS.load_local(
-            faiss_index_path, provider, allow_dangerous_deserialization=True
+        if os.path.exists(faiss_index_path):
+            try:
+                return FAISS.load_local(
+                    faiss_index_path, provider, allow_dangerous_deserialization=True
+                )
+            except RuntimeError as e:
+                if "meta tensor" in str(e):
+                    print(f"Warning: Meta tensor error when loading index: {e}")
+                    # Create a fresh index instead of loading the problematic one
+                    if os.path.exists(faiss_index_path):
+                        backup_path = f"{faiss_index_path}_problematic"
+                        if os.path.exists(backup_path):
+                            shutil.rmtree(backup_path)
+                        shutil.move(faiss_index_path, backup_path)
+
+                    print("Creating a fresh index")
+                    return FAISS.from_texts(
+                        ["initialization"], provider, metadatas=[{"empty": True}]
+                    )
+                raise  # Re-raise if it's not the meta tensor error
+        else:
+            # Create an empty index if not found
+            return FAISS.from_texts(
+                ["initialization"], provider, metadatas=[{"empty": True}]
+            )
+    except Exception as e:
+        print(f"Error loading FAISS index: {e}")
+        # Return a very basic fallback with a new model instance
+        fallback_model = SentenceTransformer(model_name, device="cpu")
+        fallback_provider = CustomSentenceTransformerEmbeddings(fallback_model)
+        return FAISS.from_texts(
+            ["Error loading index"], fallback_provider, metadatas=[{"error": str(e)}]
         )
-    else:
-        # Create an empty index if not found
-        return FAISS.from_texts(["init"], provider, metadatas=[{"empty": True}])
 
 
 # 7. Process pages in parallel with ThreadPoolExecutor
@@ -717,3 +756,200 @@ def process_document_pipeline(
             os.remove(path)
         except Exception:
             pass
+
+
+# --- NEW FUNCTIONS FOR LLM QUERY PROCESSING ---
+
+
+def process_and_cache_document(document_url: str) -> str:
+    """Process document and return FAISS index path, using cache if available"""
+    # Create a unique ID for this document
+    url_hash = hashlib.md5(document_url.encode()).hexdigest()
+    cache_path = f"{CACHE_DIR}/{url_hash}"
+
+    # Check if already cached
+    if os.path.exists(cache_path):
+        return cache_path
+
+    # Process document and build index
+    print(f"Processing document: {document_url}")
+    list(process_document_pipeline(document_url, faiss_index_path=cache_path))
+
+    # Return the cache path
+    return cache_path
+
+
+def build_prompt(context_chunks: List[str], question: str) -> str:
+    """Build an optimized prompt for insurance policy Q&A"""
+
+    # Join context chunks, with special emphasis on most relevant
+    if len(context_chunks) > 0:
+        # Give extra weight to the most relevant chunk
+        context = f"Most relevant policy information:\n{context_chunks[0]}\n\n"
+
+        # Add additional context if available
+        if len(context_chunks) > 1:
+            context += "Additional relevant policy clauses:\n" + "\n\n".join(
+                context_chunks[1:]
+            )
+    else:
+        context = "No relevant policy information found."
+
+    # Enhanced prompt for better answers
+    prompt = (
+        "You are an insurance policy expert answering questions about policy coverage and terms.\n\n"
+        "Task: Answer the question using ONLY the provided policy information below. "
+        "If the answer is not in the context, say 'Based on the provided policy information, I cannot determine this.'\n\n"
+        f"Policy Information:\n{context}\n\n"
+        f"Question: {question}\n\n"
+        "Provide a direct, concise answer without including phrases like 'Based on the context' or 'According to the document'. "
+        "Include specific details like waiting periods, percentages, or conditions when mentioned in the policy information. "
+        "Format numbers consistently (use digits for numbers and percentages)."
+    )
+    return prompt
+
+
+def query_ollama_llama3(prompt: str, retries: int = 3) -> str:
+    """Query Ollama LLM with retry logic for robustness"""
+    for attempt in range(retries):
+        try:
+            payload = {
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,  # Lower temperature for more factual responses
+                    "top_k": 40,  # Consider top 40 tokens
+                    "top_p": 0.9,  # Sample from top 90% probability mass
+                },
+            }
+            response = requests.post(OLLAMA_API_URL, json=payload, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("response") or data.get(
+                "text", "Error: No response generated"
+            )
+
+        except (requests.RequestException, KeyError) as e:
+            if attempt == retries - 1:
+                return f"Error generating response: {str(e)}"
+            time.sleep(1)  # Wait before retry
+
+
+# UPDATED: Robust search and answer function with better error handling
+def search_and_answer_question(question: str, db_path: str) -> str:
+    """Process a single question using the FAISS index and LLM with robust error handling"""
+    try:
+        try:
+            model = SentenceTransformer(EMBEDDING_MODEL, device="cpu")
+            provider = CustomSentenceTransformerEmbeddings(model)
+
+            if not os.path.exists(db_path) or "_problematic" in db_path:
+                raise ValueError("Index unavailable or problematic")
+            with torch.no_grad():
+                db = FAISS.load_local(
+                    db_path, provider, allow_dangerous_deserialization=True
+                )
+
+            retrieval_results = db.similarity_search(question, k=NUM_RELEVANT_CHUNKS)
+            context_chunks = [doc.page_content for doc in retrieval_results]
+            prompt = build_prompt(context_chunks, question)
+            try:
+                return query_ollama_llama3(prompt)
+            except:
+                return extract_answer_from_context(question, context_chunks)
+        except Exception as e:
+            print(f"Search error for '{question}': {e}")
+            return "Unable to provide a specific answer due to a technical issue with the search system."
+    except Exception as e:
+        print(f"Error processing question '{question}': {str(e)}")
+        return "Could not process this question due to a technical error."
+
+
+# ADDED: New fallback function when LLM is unavailable
+def extract_answer_from_context(question: str, context_chunks: List[str]) -> str:
+    """Extract relevant information from context when LLM is unavailable"""
+    if not context_chunks:
+        return "No relevant information found."
+    question_lower = question.lower()
+    keywords = []
+    insurance_terms = [
+        "grace period",
+        "waiting period",
+        "pre-existing",
+        "maternity",
+        "cataract",
+        "surgery",
+        "organ donor",
+        "no claim discount",
+        "ncd",
+        "preventive",
+        "health check",
+        "hospital",
+        "ayush",
+        "sub-limits",
+        "room rent",
+        "icu",
+        "plan a",
+    ]
+    for term in insurance_terms:
+        if term in question_lower:
+            keywords.append(term)
+    important_words = ["cover", "policy", "limit", "expense", "treatment", "benefit"]
+    for word in important_words:
+        if word in question_lower:
+            keywords.append(word)
+    if not keywords:
+        stop_words = [
+            "what",
+            "is",
+            "are",
+            "the",
+            "for",
+            "under",
+            "this",
+            "and",
+            "or",
+            "in",
+            "to",
+            "a",
+            "an",
+        ]
+        keywords = [word for word in question_lower.split() if word not in stop_words][
+            :3
+        ]
+    scored_chunks = []
+    for chunk in context_chunks:
+        chunk_lower = chunk.lower()
+        score = sum(10 if keyword in chunk_lower else 0 for keyword in keywords)
+        sentences = chunk.split(". ")
+        for sentence in sentences:
+            sentence_lower = sentence.lower()
+            keyword_count = sum(1 for keyword in keywords if keyword in sentence_lower)
+            if keyword_count >= 2:
+                score += 5 * keyword_count
+        if score > 0:
+            scored_chunks.append((score, chunk))
+    if scored_chunks:
+        scored_chunks.sort(reverse=True)
+        best_chunks = [chunk for _, chunk in scored_chunks[:2]]
+        if "waiting period" in question_lower:
+            for chunk in best_chunks:
+                if "waiting period" in chunk.lower():
+                    for sentence in chunk.split(". "):
+                        if (
+                            "waiting period" in sentence.lower()
+                            and any(str(i) for i in range(10)) in sentence
+                        ):
+                            return sentence + "."
+        if "grace period" in question_lower:
+            for chunk in best_chunks:
+                if "grace period" in chunk.lower():
+                    for sentence in chunk.split(". "):
+                        if (
+                            "grace period" in sentence.lower()
+                            and any(str(i) for i in range(10)) in sentence
+                        ):
+                            return sentence + "."
+        return ". ".join(best_chunks)
+    return "Based on the available information, I cannot provide a specific answer to this question."

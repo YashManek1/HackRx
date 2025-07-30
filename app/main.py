@@ -1,76 +1,134 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Dict, Any
-import uvicorn
+import os
+import time
+from typing import List, Dict
+from fastapi import FastAPI, HTTPException, Depends, Header
+from pydantic import BaseModel, HttpUrl
+import concurrent.futures
 
 from fastAPI.pipeline import (
-    process_document_pipeline,
-    load_faiss_index,
-    FAISS_INDEX_PATH,
+    process_and_cache_document,
+    search_and_answer_question,
+    CACHE_DIR,
 )
 
-app = FastAPI(title="Intelligent Doc Ingestion and Embedding API")
+app = FastAPI(title="LLM-Powered Insurance Document QA API")
+
+# --- Config ---
+API_TOKEN = "ac87f477355b48f584ff8cfda844019371e02ec24ea2493df2ba7baa7682e461"
 
 
-class IngestRequest(BaseModel):
-    url: str
-
-
+# --- Request/Response Models ---
 class QueryRequest(BaseModel):
-    query: str
-    top_k: int = 5
+    documents: HttpUrl
+    questions: List[str]
 
 
-@app.post("/ingest")
-def ingest_document(req: IngestRequest):
+class QueryResponse(BaseModel):
+    answers: List[str]
+
+
+# --- Auth dependency ---
+def verify_token(authorization: str = Header(...)):
+    token = authorization.replace("Bearer ", "")
+    if token != API_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid API token")
+    return token
+
+
+# --- Ensure cache directory exists ---
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+# --- Main API Endpoint ---
+@app.post("/api/v1/hackrx/run", response_model=QueryResponse)
+async def process_queries(query: QueryRequest, token: str = Depends(verify_token)):
+    """
+    Process document and answer questions in a single endpoint.
+
+    Args:
+        query: Request containing document URL and list of questions
+
+    Returns:
+        QueryResponse: List of answers corresponding to questions
+    """
+    start_time = time.time()
+
     try:
-        # Streaming page-wise processing
-        results = []
-        for page_result in process_document_pipeline(req.url):
-            # You can log or print here for live feedback
-            results.append(
-                {
-                    "page_number": page_result["page_number"],
-                    "num_sentences": page_result["num_sentences"],
-                    "sample_sentence": (
-                        page_result["sentences"][0] if page_result["sentences"] else ""
-                    ),
-                    "embedding_shape": (  # FIX IS HERE
-                        len(
-                            page_result["embeddings"][0]
-                        )  # Just get the length directly
-                        if page_result["embeddings"]
-                        else 0
-                    ),
-                    "metadata_sample": (
-                        page_result["metadatas"][0] if page_result["metadatas"] else {}
-                    ),
-                }
+        # Process document in a separate thread to keep FastAPI responsive
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            db_path_future = executor.submit(
+                process_and_cache_document, str(query.documents)
             )
-        return {
-            "status": "success",
-            "faiss_index_path": FAISS_INDEX_PATH,
-            "pages_processed": results,
-        }
+
+            # Wait for document processing to complete
+            db_path = db_path_future.result()
+
+        processing_time = time.time() - start_time
+        print(f"Document processing completed in {processing_time:.2f} seconds")
+
+        # Process all questions in parallel for speed
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            answer_futures = {
+                executor.submit(search_and_answer_question, q, db_path): i
+                for i, q in enumerate(query.questions)
+            }
+
+            # Collect answers in correct order
+            answers = [""] * len(query.questions)
+            for future in concurrent.futures.as_completed(answer_futures):
+                idx = answer_futures[future]
+                try:
+                    answers[idx] = future.result()
+                except Exception as e:
+                    answers[idx] = f"Error processing question: {str(e)}"
+
+        total_time = time.time() - start_time
+        print(f"Total query processing completed in {total_time:.2f} seconds")
+
+        return QueryResponse(answers=answers)
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error in API endpoint: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to process query: {str(e)}"
+        )
 
 
-@app.post("/query")
-def query_faiss(req: QueryRequest):
-    """
-    Query the FAISS index with a natural language question.
-    """
+# Add to main.py
+@app.on_event("startup")
+async def startup_event():
     try:
-        db = load_faiss_index()
-        docs = db.similarity_search(req.query, k=req.top_k)
-        results = []
-        for doc in docs:
-            results.append({"content": doc.page_content, "metadata": doc.metadata})
-        return {"matches": results}
+        # Force CPU mode to avoid CUDA/meta tensor issues
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        
+        # Pre-warm embedding model by loading it once
+        from sentence_transformers import SentenceTransformer
+        from fastAPI.pipeline import EMBEDDING_MODEL
+        
+        print("Pre-warming embedding model...")
+        global embedding_model
+        embedding_model = SentenceTransformer(EMBEDDING_MODEL, device='cpu')
+        print("Successfully pre-warmed embedding model")
+        
+        # Try to pre-warm Ollama
+        try:
+            import requests
+            print("Testing Ollama connection...")
+            response = requests.post(
+                "http://localhost:11434/api/generate", 
+                json={"model": "llama3.1:8b", "prompt": "Hello", "stream": False},
+                timeout=5
+            )
+            print("Successfully connected to Ollama")
+        except Exception as ollama_err:
+            print(f"Ollama not available: {ollama_err}")
+            print("Will use rule-based fallback for answers")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error in startup: {e}")
+        print("Continuing with on-demand model loading")
 
 
 if __name__ == "__main__":
-    uvicorn.run("fastAPI.main:app", host="0.0.0.0", port=8000, reload=True)
+    import uvicorn
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
