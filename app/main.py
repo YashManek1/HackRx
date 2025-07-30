@@ -1,14 +1,19 @@
 import os
 import time
-from typing import List, Dict
+import concurrent.futures
+from typing import List
 from fastapi import FastAPI, HTTPException, Depends, Header
 from pydantic import BaseModel, HttpUrl
-import concurrent.futures
+import hashlib
+import shutil
 
 from fastAPI.pipeline import (
     process_and_cache_document,
     search_and_answer_question,
     CACHE_DIR,
+    EMBEDDING_MODEL,
+    OLLAMA_MODEL,
+    OLLAMA_API_URL,
 )
 
 app = FastAPI(title="LLM-Powered Insurance Document QA API")
@@ -25,6 +30,26 @@ class QueryRequest(BaseModel):
 
 class QueryResponse(BaseModel):
     answers: List[str]
+
+
+# Add this near the top of your main.py file
+def safely_process_document(url: str) -> str:
+    """Process document with better error handling"""
+    try:
+        url_hash = hashlib.md5(url.encode()).hexdigest()
+        cache_path = f"{CACHE_DIR}/{url_hash}"
+
+        # If cache exists but is problematic, remove it to force reprocessing
+        if os.path.exists(f"{cache_path}_problematic"):
+            shutil.rmtree(f"{cache_path}_problematic")
+            if os.path.exists(cache_path):
+                shutil.rmtree(cache_path)
+
+        # Process normally
+        return process_and_cache_document(url)
+    except Exception as e:
+        print(f"Document processing error: {e}")
+        return f"{CACHE_DIR}/error_{hashlib.md5(url.encode()).hexdigest()}"
 
 
 # --- Auth dependency ---
@@ -57,7 +82,7 @@ async def process_queries(query: QueryRequest, token: str = Depends(verify_token
         # Process document in a separate thread to keep FastAPI responsive
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             db_path_future = executor.submit(
-                process_and_cache_document, str(query.documents)
+                safely_process_document, str(query.documents)
             )
 
             # Wait for document processing to complete
@@ -80,6 +105,9 @@ async def process_queries(query: QueryRequest, token: str = Depends(verify_token
                 try:
                     answers[idx] = future.result()
                 except Exception as e:
+                    print(
+                        f"Error processing question '{query.questions[idx]}': {str(e)}"
+                    )
                     answers[idx] = f"Error processing question: {str(e)}"
 
         total_time = time.time() - start_time
@@ -88,36 +116,43 @@ async def process_queries(query: QueryRequest, token: str = Depends(verify_token
         return QueryResponse(answers=answers)
 
     except Exception as e:
-        print(f"Error in API endpoint: {str(e)}")
-        raise HTTPException(
-            status_code=500, detail=f"Failed to process query: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# Add to main.py
 @app.on_event("startup")
 async def startup_event():
     try:
         # Force CPU mode to avoid CUDA/meta tensor issues
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
-        
-        # Pre-warm embedding model by loading it once
+
+        # Pre-warm embedding model by loading it once with proper device handling
         from sentence_transformers import SentenceTransformer
-        from fastAPI.pipeline import EMBEDDING_MODEL
-        
+        import torch
+
         print("Pre-warming embedding model...")
         global embedding_model
-        embedding_model = SentenceTransformer(EMBEDDING_MODEL, device='cpu')
+
+        # Use explicit device context to avoid meta tensor issues
+        with torch.device("cpu"):
+            embedding_model = SentenceTransformer(EMBEDDING_MODEL, device="cpu")
+            embedding_model.eval()  # Set to evaluation mode
+
         print("Successfully pre-warmed embedding model")
-        
+
+        # Make the model available to the pipeline module as global
+        import fastAPI.pipeline as pipeline
+
+        pipeline.global_embedding_model = embedding_model
+
         # Try to pre-warm Ollama
         try:
             import requests
+
             print("Testing Ollama connection...")
             response = requests.post(
-                "http://localhost:11434/api/generate", 
-                json={"model": "llama3.1:8b", "prompt": "Hello", "stream": False},
-                timeout=5
+                OLLAMA_API_URL,
+                json={"model": OLLAMA_MODEL, "prompt": "Hello", "stream": False},
+                timeout=5,
             )
             print("Successfully connected to Ollama")
         except Exception as ollama_err:

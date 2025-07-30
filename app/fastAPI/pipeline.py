@@ -33,6 +33,9 @@ OLLAMA_MODEL = "llama3.1:8b"
 # Initialize tokenizer for token counting
 tokenizer = tiktoken.get_encoding("cl100k_base")  # GPT-4 tokenizer
 
+# Global embedding model to avoid meta tensor issues
+global_embedding_model = None
+
 # Ensure cache directory exists
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -543,11 +546,21 @@ def save_faiss_index(db: FAISS, faiss_index_path: str):
 def load_faiss_index(
     faiss_index_path: str = FAISS_INDEX_PATH, model_name: str = EMBEDDING_MODEL
 ):
-    """Load FAISS index from disk with robust error handling for meta tensor issues"""
+    """Load FAISS index with fix for meta tensor issues"""
     try:
-        # Force CPU mode to avoid meta tensor issues
-        device = "cpu"
-        model = SentenceTransformer(model_name, device=device)
+        # Use the global pre-warmed model if available to avoid meta tensor issues
+        global global_embedding_model
+        if global_embedding_model is not None:
+            model = global_embedding_model
+        else:
+            # Fallback: create model with explicit CPU device and proper tensor handling
+            import torch
+
+            with torch.device("cpu"):
+                model = SentenceTransformer(model_name, device="cpu")
+                # Ensure all model parameters are properly loaded to CPU
+                model.eval()
+
         provider = CustomSentenceTransformerEmbeddings(model)
 
         if os.path.exists(faiss_index_path):
@@ -556,29 +569,28 @@ def load_faiss_index(
                     faiss_index_path, provider, allow_dangerous_deserialization=True
                 )
             except RuntimeError as e:
-                if "meta tensor" in str(e):
-                    print(f"Warning: Meta tensor error when loading index: {e}")
-                    # Create a fresh index instead of loading the problematic one
-                    if os.path.exists(faiss_index_path):
-                        backup_path = f"{faiss_index_path}_problematic"
-                        if os.path.exists(backup_path):
-                            shutil.rmtree(backup_path)
-                        shutil.move(faiss_index_path, backup_path)
-
-                    print("Creating a fresh index")
-                    return FAISS.from_texts(
-                        ["initialization"], provider, metadatas=[{"empty": True}]
-                    )
-                raise  # Re-raise if it's not the meta tensor error
+                print(f"Warning: Error when loading index: {e}")
+                # Create a fresh index
+                backup_path = f"{faiss_index_path}_problematic_{int(time.time())}"
+                shutil.move(faiss_index_path, backup_path)
+                print(f"Moved problematic index to: {backup_path}")
+                print("Creating a fresh index")
+                return FAISS.from_texts(
+                    ["initialization"], provider, metadatas=[{"empty": True}]
+                )
         else:
-            # Create an empty index if not found
             return FAISS.from_texts(
                 ["initialization"], provider, metadatas=[{"empty": True}]
             )
     except Exception as e:
         print(f"Error loading FAISS index: {e}")
-        # Return a very basic fallback with a new model instance
-        fallback_model = SentenceTransformer(model_name, device="cpu")
+        # Use the global model if available, otherwise create a new one
+        if global_embedding_model is not None:
+            fallback_model = global_embedding_model
+        else:
+            with torch.device("cpu"):
+                fallback_model = SentenceTransformer(model_name, device="cpu")
+                fallback_model.eval()
         fallback_provider = CustomSentenceTransformerEmbeddings(fallback_model)
         return FAISS.from_texts(
             ["Error loading index"], fallback_provider, metadatas=[{"error": str(e)}]
@@ -648,7 +660,15 @@ def process_document_pipeline(
 
     try:
         # Load the model once and share across threads
-        model = SentenceTransformer(embedding_model)
+        # Use global model if available to avoid meta tensor issues
+        global global_embedding_model
+        if global_embedding_model is not None:
+            model = global_embedding_model
+        else:
+            # Create model with proper device context
+            with torch.device("cpu"):
+                model = SentenceTransformer(embedding_model, device="cpu")
+                model.eval()
 
         # Extract all pages
         pages = extract_pages_by_type(path, mime_type)
@@ -838,31 +858,56 @@ def query_ollama_llama3(prompt: str, retries: int = 3) -> str:
 
 # UPDATED: Robust search and answer function with better error handling
 def search_and_answer_question(question: str, db_path: str) -> str:
-    """Process a single question using the FAISS index and LLM with robust error handling"""
+    """Process a single question using the FAISS index and LLM with better meta tensor handling"""
     try:
+        # Ensure we have a directory and it's not problematic
+        if not os.path.exists(db_path) or "_problematic" in db_path:
+            return "Unable to access document index. Please reprocess the document."
+
         try:
-            model = SentenceTransformer(EMBEDDING_MODEL, device="cpu")
+            # CRITICAL FIX: Always use the global pre-warmed model to avoid meta tensor issues
+            global global_embedding_model
+            if global_embedding_model is None:
+                # Initialize the global model if it doesn't exist
+                import torch
+
+                with torch.device("cpu"):
+                    global_embedding_model = SentenceTransformer(
+                        EMBEDDING_MODEL, device="cpu"
+                    )
+                    global_embedding_model.eval()
+
+            # Use the global model - this is key to avoiding meta tensor issues
+            model = global_embedding_model
+
+            # Create embedding provider using the existing model
             provider = CustomSentenceTransformerEmbeddings(model)
 
-            if not os.path.exists(db_path) or "_problematic" in db_path:
-                raise ValueError("Index unavailable or problematic")
-            with torch.no_grad():
-                db = FAISS.load_local(
-                    db_path, provider, allow_dangerous_deserialization=True
-                )
+            # Load the FAISS index using the existing FAISS import
+            db = FAISS.load_local(
+                db_path, provider, allow_dangerous_deserialization=True
+            )
 
+            # Search for relevant chunks
             retrieval_results = db.similarity_search(question, k=NUM_RELEVANT_CHUNKS)
             context_chunks = [doc.page_content for doc in retrieval_results]
-            prompt = build_prompt(context_chunks, question)
+
+            # Try LLM, fall back to rule-based
             try:
+                prompt = build_prompt(context_chunks, question)
                 return query_ollama_llama3(prompt)
-            except:
+            except Exception as llm_error:
+                print(f"LLM error, falling back to rule-based: {llm_error}")
                 return extract_answer_from_context(question, context_chunks)
-        except Exception as e:
-            print(f"Search error for '{question}': {e}")
-            return "Unable to provide a specific answer due to a technical issue with the search system."
+
+        except Exception as search_error:
+            print(f"Search infrastructure error for '{question}': {search_error}")
+            return (
+                "Unable to search document due to a technical issue. Please try again."
+            )
+
     except Exception as e:
-        print(f"Error processing question '{question}': {str(e)}")
+        print(f"Unexpected error processing question '{question}': {str(e)}")
         return "Could not process this question due to a technical error."
 
 
