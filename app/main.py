@@ -4,17 +4,17 @@ import concurrent.futures
 from typing import List
 from fastapi import FastAPI, HTTPException, Depends, Header
 from pydantic import BaseModel, HttpUrl
-import hashlib
-import shutil
+import torch
 
-from fastAPI.pipeline import (
-    process_and_cache_document,
-    search_and_answer_question,
-    CACHE_DIR,
-    EMBEDDING_MODEL,
-    OLLAMA_MODEL,
-    OLLAMA_API_URL,
-)
+# Fix the import - use relative import or direct import
+try:
+    from fastAPI.pipeline import process_questions, EMBEDDING_MODEL, OLLAMA_MODEL
+except ImportError:
+    # Fallback if pipeline.py is in a different location
+    import sys
+
+    sys.path.append(".")
+    from fastAPI.pipeline import process_questions, EMBEDDING_MODEL, OLLAMA_MODEL
 
 app = FastAPI(title="LLM-Powered Insurance Document QA API")
 
@@ -32,36 +32,12 @@ class QueryResponse(BaseModel):
     answers: List[str]
 
 
-# Add this near the top of your main.py file
-def safely_process_document(url: str) -> str:
-    """Process document with better error handling"""
-    try:
-        url_hash = hashlib.md5(url.encode()).hexdigest()
-        cache_path = f"{CACHE_DIR}/{url_hash}"
-
-        # If cache exists but is problematic, remove it to force reprocessing
-        if os.path.exists(f"{cache_path}_problematic"):
-            shutil.rmtree(f"{cache_path}_problematic")
-            if os.path.exists(cache_path):
-                shutil.rmtree(cache_path)
-
-        # Process normally
-        return process_and_cache_document(url)
-    except Exception as e:
-        print(f"Document processing error: {e}")
-        return f"{CACHE_DIR}/error_{hashlib.md5(url.encode()).hexdigest()}"
-
-
 # --- Auth dependency ---
 def verify_token(authorization: str = Header(...)):
     token = authorization.replace("Bearer ", "")
     if token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid API token")
     return token
-
-
-# --- Ensure cache directory exists ---
-os.makedirs(CACHE_DIR, exist_ok=True)
 
 
 # --- Main API Endpoint ---
@@ -79,39 +55,11 @@ async def process_queries(query: QueryRequest, token: str = Depends(verify_token
     start_time = time.time()
 
     try:
-        # Process document in a separate thread to keep FastAPI responsive
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            db_path_future = executor.submit(
-                safely_process_document, str(query.documents)
-            )
-
-            # Wait for document processing to complete
-            db_path = db_path_future.result()
-
-        processing_time = time.time() - start_time
-        print(f"Document processing completed in {processing_time:.2f} seconds")
-
-        # Process all questions in parallel for speed
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            answer_futures = {
-                executor.submit(search_and_answer_question, q, db_path): i
-                for i, q in enumerate(query.questions)
-            }
-
-            # Collect answers in correct order
-            answers = [""] * len(query.questions)
-            for future in concurrent.futures.as_completed(answer_futures):
-                idx = answer_futures[future]
-                try:
-                    answers[idx] = future.result()
-                except Exception as e:
-                    print(
-                        f"Error processing question '{query.questions[idx]}': {str(e)}"
-                    )
-                    answers[idx] = f"Error processing question: {str(e)}"
+        # Process document and questions
+        answers = process_questions(str(query.documents), query.questions)
 
         total_time = time.time() - start_time
-        print(f"Total query processing completed in {total_time:.2f} seconds")
+        print(f"Total processing completed in {total_time:.2f} seconds")
 
         return QueryResponse(answers=answers)
 
@@ -119,48 +67,95 @@ async def process_queries(query: QueryRequest, token: str = Depends(verify_token
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# --- Health Check Endpoint ---
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "gpu_available": torch.cuda.is_available(),
+        "embedding_model": EMBEDDING_MODEL,
+        "llm_model": OLLAMA_MODEL,
+        "timestamp": time.time(),
+    }
+
+
+# --- Startup Event ---
 @app.on_event("startup")
 async def startup_event():
     try:
-        # Force CPU mode to avoid CUDA/meta tensor issues
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {device}")
 
-        # Pre-warm embedding model by loading it once with proper device handling
+        # Pre-warm embedding model
         from sentence_transformers import SentenceTransformer
-        import torch
 
-        print("Pre-warming embedding model...")
-        global embedding_model
+        print(f"Pre-warming embedding model on {device}...")
 
-        # Use explicit device context to avoid meta tensor issues
-        with torch.device("cpu"):
-            embedding_model = SentenceTransformer(EMBEDDING_MODEL, device="cpu")
-            embedding_model.eval()  # Set to evaluation mode
+        with torch.device(device):
+            embedding_model = SentenceTransformer(
+                "BAAI/bge-small-en-v1.5", device=device
+            )
+            embedding_model.eval()
 
-        print("Successfully pre-warmed embedding model")
+        print(f"Successfully pre-warmed embedding model on {device}")
 
-        # Make the model available to the pipeline module as global
-        import fastAPI.pipeline as pipeline
+        # Make model available globally
+        try:
+            import fastAPI.pipeline
 
-        pipeline.global_embedding_model = embedding_model
+            fastAPI.pipeline.global_embedding_model = embedding_model
+            print("Successfully set global embedding model")
+        except Exception as e:
+            print(f"Warning: Could not set global embedding model: {e}")
 
-        # Try to pre-warm Ollama
+        # Test Ollama connection
         try:
             import requests
 
             print("Testing Ollama connection...")
             response = requests.post(
-                OLLAMA_API_URL,
-                json={"model": OLLAMA_MODEL, "prompt": "Hello", "stream": False},
+                f"http://localhost:11434/api/generate",
+                json={"model": "llama3.1:8b", "prompt": "Hello", "stream": False},
                 timeout=5,
             )
-            print("Successfully connected to Ollama")
+            if response.status_code == 200:
+                print("Successfully connected to Ollama")
+            else:
+                print(f"Ollama responded with status {response.status_code}")
         except Exception as ollama_err:
             print(f"Ollama not available: {ollama_err}")
-            print("Will use rule-based fallback for answers")
+            print("Will use pattern-based fallback for answers")
+
+        # Print system information
+        print("=== System Information ===")
+        print(f"PyTorch version: {torch.__version__}")
+        print(f"CUDA available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            print(f"CUDA version: {torch.version.cuda}")
+            print(f"GPU device: {torch.cuda.get_device_name(0)}")
+            print(
+                f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB"
+            )
+        print(f"Embedding model: BAAI/bge-small-en-v1.5")
+        print(f"LLM model: llama3.1:8b")
+        print("=========================")
+
     except Exception as e:
         print(f"Error in startup: {e}")
         print("Continuing with on-demand model loading")
+
+
+# --- Shutdown Event ---
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("Cleanup completed")
+    except Exception as e:
+        print(f"Error during cleanup: {e}")
 
 
 if __name__ == "__main__":

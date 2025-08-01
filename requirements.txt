@@ -16,3 +16,9 @@ pydantic
 psycopg2-binary
 python-multipart
 aiofiles
+datasets
+transformers
+trl
+unsloth
+huggingface_hub
+langchain_community

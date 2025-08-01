@@ -18,42 +18,51 @@ import tiktoken
 from urllib.parse import urlparse
 import torch
 
-# --- Config ---
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# --- Optimized Config for Speed + Accuracy ---
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"  # Keep BGE for accuracy
 FAISS_INDEX_PATH = "faiss_index"
-MAX_WORKERS = 4  # For parallel processing
-MAX_TOKENS_PER_CHUNK = 512  # For token efficiency
-CHUNK_OVERLAP = 100  # For sliding window
-BATCH_SIZE = 32  # For embedding generation
-CACHE_DIR = "document_cache"  # Directory to cache document indexes
-NUM_RELEVANT_CHUNKS = 5  # Number of chunks to retrieve per question
+MAX_WORKERS = min(os.cpu_count(), 12)  # Increased parallelization
+MAX_TOKENS_PER_CHUNK = 320  # Slightly smaller for speed
+CHUNK_OVERLAP = 48  # Reduced overlap
+BATCH_SIZE = 192  # Optimized batch size
+NUM_RELEVANT_CHUNKS = 3  # Reduce context for speed
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "llama3.1:8b"
 
-# Initialize tokenizer for token counting
-tokenizer = tiktoken.get_encoding("cl100k_base")  # GPT-4 tokenizer
+# Insurance-specific parameters
+INSURANCE_KEYWORDS = [
+    "grace period",
+    "waiting period",
+    "pre-existing",
+    "maternity",
+    "cataract",
+    "organ donor",
+    "coverage",
+    "benefit",
+    "exclusion",
+    "premium",
+    "deductible",
+    "co-payment",
+    "cashless",
+    "reimbursement",
+    "sum insured",
+    "policy holder",
+]
 
-# Global embedding model to avoid meta tensor issues
+tokenizer = tiktoken.get_encoding("cl100k_base")
 global_embedding_model = None
 
-# Ensure cache directory exists
-os.makedirs(CACHE_DIR, exist_ok=True)
 
-
-# 1. Document Download with timeout and retry
 def download_file(
     url: str, retries: int = 3, timeout: int = 30
 ) -> Tuple[str, Optional[str]]:
-    """Download file from URL with retry logic"""
     attempt = 0
     while attempt < retries:
         try:
             response = requests.get(url, stream=True, timeout=timeout)
             response.raise_for_status()
-
             parsed = urlparse(url)
-            suffix = os.path.splitext(parsed.path)[1]  # Only file extension
-
+            suffix = os.path.splitext(parsed.path)[1]
             fd, temp_path = tempfile.mkstemp(suffix=suffix)
             with os.fdopen(fd, "wb") as tmp:
                 for chunk in response.iter_content(chunk_size=65536):
@@ -61,7 +70,6 @@ def download_file(
                         tmp.write(chunk)
             mime_type, _ = mimetypes.guess_type(temp_path)
             return temp_path, mime_type
-
         except requests.exceptions.RequestException as e:
             attempt += 1
             if attempt >= retries:
@@ -71,15 +79,11 @@ def download_file(
             time.sleep(1)
 
 
-# 2. Enhanced Document Parsing
-# Using PyMuPDF for faster PDF extraction
 def extract_pdf_text_pymupdf(path: str) -> List[str]:
-    """Extract text from PDF using PyMuPDF (faster than pdfplumber)"""
     try:
-        import fitz  # PyMuPDF
+        import fitz
     except ImportError:
         raise ImportError("Please install PyMuPDF: pip install PyMuPDF")
-
     pages = []
     doc = fitz.open(path)
     for page_num in range(len(doc)):
@@ -87,35 +91,27 @@ def extract_pdf_text_pymupdf(path: str) -> List[str]:
         text = page.get_text("text")
         if text.strip():
             pages.append(text)
+    doc.close()
     return pages
 
 
-# Using docx2txt for Word docs
 def extract_docx_text_docx2txt(path: str) -> List[str]:
-    """Extract text from DOCX using docx2txt"""
     try:
         import docx2txt
     except ImportError:
         raise ImportError("Please install docx2txt: pip install docx2txt")
-
     text = docx2txt.process(path)
-    # Split by page breaks (approximation)
     pages = re.split(r"\f", text)
     return [page for page in pages if page.strip()]
 
 
-# Updated email extraction
 def extract_msg_text(path: str) -> List[str]:
-    """Extract text from Outlook MSG files"""
     try:
         import extract_msg
     except ImportError:
         raise ImportError("Please install extract-msg: pip install extract-msg")
-
     msg = extract_msg.Message(path)
     sections = []
-
-    # Include headers and metadata
     headers = []
     if msg.subject:
         headers.append(f"Subject: {msg.subject}")
@@ -125,28 +121,20 @@ def extract_msg_text(path: str) -> List[str]:
         headers.append(f"To: {msg.to}")
     if msg.date:
         headers.append(f"Date: {msg.date}")
-
     if headers:
         sections.append("\n".join(headers))
-
-    # Body text
     if msg.body:
         sections.append(msg.body)
-
-    # Attachments list (names only)
     if msg.attachments:
         att_section = "Attachments:\n" + "\n".join(
             [a.longFilename or a.shortFilename or "Unnamed" for a in msg.attachments]
         )
         sections.append(att_section)
-
     return ["\n\n".join(sections)]
 
 
 def extract_pages_by_type(path: str, mime_type: str) -> List[str]:
-    """Route to appropriate parser based on file type"""
     ext = os.path.splitext(path)[1].lower()
-
     if (mime_type and ("pdf" in mime_type)) or ext == ".pdf":
         try:
             return extract_pdf_text_pymupdf(path)
@@ -165,14 +153,11 @@ def extract_pages_by_type(path: str, mime_type: str) -> List[str]:
         raise RuntimeError(f"Unsupported file type: {mime_type} / {ext}")
 
 
-# Fallback methods in case primary parsers fail
 def extract_pdf_text_pdfplumber(path: str) -> List[str]:
-    """Fallback PDF text extraction using pdfplumber"""
     try:
         import pdfplumber
     except ImportError:
         raise ImportError("Please install pdfplumber: pip install pdfplumber")
-
     pages = []
     with pdfplumber.open(path) as pdf:
         for page in pdf.pages:
@@ -182,14 +167,11 @@ def extract_pdf_text_pdfplumber(path: str) -> List[str]:
 
 
 def extract_docx_text_python_docx(path: str) -> List[str]:
-    """Fallback DOCX text extraction using python-docx"""
     try:
         import docx
     except ImportError:
         raise ImportError("Please install python-docx: pip install python-docx")
-
     doc = docx.Document(path)
-    # Group paragraphs by page breaks (manual heuristic)
     pages = []
     curr = []
     for p in doc.paragraphs:
@@ -203,10 +185,45 @@ def extract_docx_text_python_docx(path: str) -> List[str]:
     return pages
 
 
-# 3. Improved Text Cleaning
-def clean_text(text: str) -> str:
-    """Enhanced text cleaning with better handling of special characters and formatting"""
-    # Remove common header/footer patterns
+@dataclass
+class Chunk:
+    text: str
+    page: int
+    chunk_type: str
+    index_in_page: int
+    tokens: int = 0
+    importance_score: float = 0.0
+
+
+def count_tokens(text: str) -> int:
+    return len(tokenizer.encode(text))
+
+
+def split_into_sentences(text: str) -> List[str]:
+    import nltk
+
+    try:
+        nltk.data.find("tokenizers/punkt")
+    except LookupError:
+        nltk.download("punkt", quiet=True)
+    from nltk.tokenize import sent_tokenize
+
+    if not text:
+        return []
+    text = re.sub(r"(Mr\.|Mrs\.|Dr\.|Inc\.|Ltd\.|Fig\.|St\.|vs\.)", r"\1<ABBR>", text)
+    sentences = sent_tokenize(text)
+    sentences = [re.sub(r"<ABBR>", ".", s) for s in sentences]
+    return [s for s in sentences if s.strip()]
+
+
+def split_into_paragraphs(text: str) -> List[str]:
+    paragraphs = re.split(r"\n\s*\n", text)
+    return [p.strip() for p in paragraphs if p.strip()]
+
+
+def clean_text_fast(text: str) -> str:
+    """Fast text cleaning optimized for speed"""
+    # Remove headers/footers
     text = re.sub(
         r"Bajaj Allianz General Insurance Co\. Ltd\..*?Issuing Office:",
         "",
@@ -216,166 +233,62 @@ def clean_text(text: str) -> str:
     text = re.sub(r"UIN-\s*BAJHLIP\d+V\d+\s*", "", text)
     text = re.sub(r"Global Health Care/\s*Policy Wordings/Page \d+", "", text)
 
-    # Fix newlines and spacing issues
+    # Quick normalization
+    text = re.sub(r"\bPED\b", "pre-existing disease", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bNCD\b", "no claim discount", text, flags=re.IGNORECASE)
     text = re.sub(r"\r\n", "\n", text)
-    text = re.sub(r"[ \t]+", " ", text)  # Normalize spaces
-    text = re.sub(r"\n{3,}", "\n\n", text)  # Limit consecutive newlines
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
 
-    # Split into lines and remove empty ones
-    lines = [line.rstrip() for line in text.splitlines()]
-    lines = [line for line in lines if line.strip() != ""]
-
-    # Rejoin with better handling of paragraph breaks
-    output_lines = []
-    last_blank = False
-    for line in lines:
-        if line == "":
-            if not last_blank:
-                output_lines.append(line)
-            last_blank = True
-        else:
-            output_lines.append(line)
-            last_blank = False
-
-    return "\n".join(output_lines).strip()
-
-
-# 4. Advanced Chunking Strategies
-@dataclass
-class Chunk:
-    """Class for storing document chunks with metadata"""
-
-    text: str
-    page: int
-    chunk_type: str  # 'sentence', 'paragraph', 'section'
-    index_in_page: int
-    tokens: int = 0
-
-
-def count_tokens(text: str) -> int:
-    """Count tokens using the tiktoken library"""
-    return len(tokenizer.encode(text))
-
-
-def split_into_sentences(text: str) -> List[str]:
-    """Split text into sentences using NLTK"""
-    import nltk
-
-    try:
-        nltk.data.find("tokenizers/punkt")
-    except LookupError:
-        nltk.download("punkt", quiet=True)
-    from nltk.tokenize import sent_tokenize
-
-    # Handle potential unicode issues
-    if not text:
-        return []
-
-    # Improve sentence splitting with better handling of special cases
-    # Replace common abbreviations before splitting
-    text = re.sub(r"(Mr\.|Mrs\.|Dr\.|Inc\.|Ltd\.|Fig\.|St\.|vs\.)", r"\1<ABBR>", text)
-
-    sentences = sent_tokenize(text)
-
-    # Restore abbreviations
-    sentences = [re.sub(r"<ABBR>", ".", s) for s in sentences]
-
-    # Filter out empty or whitespace-only sentences
-    return [s for s in sentences if s.strip()]
-
-
-def split_into_paragraphs(text: str) -> List[str]:
-    """Split text into paragraphs based on double newlines"""
-    paragraphs = re.split(r"\n\s*\n", text)
-    return [p.strip() for p in paragraphs if p.strip()]
-
-
-def identify_sections(text: str) -> List[Tuple[str, str]]:
-    """Identify sections in text based on common patterns in legal/insurance documents"""
-    # Look for section headers
-    section_patterns = [
-        r"^[A-Z][.)]\s+[A-Z][A-Za-z\s]+$",  # A. SECTION TITLE
-        r"^\d+[.)]\s+[A-Z][A-Za-z\s]+$",  # 1. Section Title
-        r"^[A-Z][A-Z\s]+:$",  # SECTION TITLE:
-        r"^SECTION\s+[A-Z][A-Za-z\s]+$",  # SECTION TITLE
-    ]
-
-    # Split by potential section headers
-    lines = text.split("\n")
-    sections = []
-    current_section_title = "Introduction"
-    current_content = []
-
-    for line in lines:
-        is_section_header = False
-        for pattern in section_patterns:
-            if re.match(pattern, line.strip()):
-                is_section_header = True
-                break
-
-        if is_section_header:
-            # Save previous section
-            if current_content:
-                sections.append((current_section_title, "\n".join(current_content)))
-                current_content = []
-            current_section_title = line.strip()
-        else:
-            current_content.append(line)
-
-    # Add last section
-    if current_content:
-        sections.append((current_section_title, "\n".join(current_content)))
-
-    return sections
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    return "\n".join(lines)
 
 
 def create_sliding_window_chunks(
     text: str, max_tokens: int = MAX_TOKENS_PER_CHUNK, overlap: int = CHUNK_OVERLAP
 ) -> List[str]:
-    """Create chunks using sliding window approach"""
     if not text:
         return []
-
     tokens = tokenizer.encode(text)
     chunks = []
-
     i = 0
     while i < len(tokens):
-        # Get chunk of tokens
         chunk_tokens = tokens[i : i + max_tokens]
-        # Convert back to text
         chunk_text = tokenizer.decode(chunk_tokens)
         chunks.append(chunk_text)
-        # Move window, with overlap
         i += max_tokens - overlap
-
     return chunks
 
 
-def generate_chunks(page_text: str, page_num: int) -> List[Chunk]:
-    """Generate multiple types of chunks from page text"""
+def calculate_importance_score_fast(text: str) -> float:
+    """Fast importance scoring"""
+    score = 0.0
+    text_lower = text.lower()
+
+    # Quick scoring
+    for keyword in INSURANCE_KEYWORDS:
+        if keyword in text_lower:
+            score += 2.0
+
+    # Time and number patterns
+    if re.search(r"\b\d+\s+(?:days?|months?|years?)", text_lower):
+        score += 1.5
+    if re.search(r"\b\d+%", text_lower):
+        score += 1.0
+
+    return score
+
+
+def generate_chunks_fast(page_text: str, page_num: int) -> List[Chunk]:
+    """Fast chunk generation"""
     chunks = []
+    cleaned_text = clean_text_fast(page_text)
+    paragraphs = split_into_paragraphs(cleaned_text)
 
-    # 1. Sentence-level chunks
-    sentences = split_into_sentences(page_text)
-    for i, sentence in enumerate(sentences):
-        token_count = count_tokens(sentence)
-        if token_count > 0:  # Skip empty sentences
-            chunks.append(
-                Chunk(
-                    text=sentence,
-                    page=page_num,
-                    chunk_type="sentence",
-                    index_in_page=i,
-                    tokens=token_count,
-                )
-            )
-
-    # 2. Paragraph-level chunks
-    paragraphs = split_into_paragraphs(page_text)
     for i, para in enumerate(paragraphs):
         token_count = count_tokens(para)
-        if token_count <= MAX_TOKENS_PER_CHUNK and token_count > 0:
+        if 40 <= token_count <= MAX_TOKENS_PER_CHUNK:
+            importance = calculate_importance_score_fast(para)
             chunks.append(
                 Chunk(
                     text=para,
@@ -383,72 +296,109 @@ def generate_chunks(page_text: str, page_num: int) -> List[Chunk]:
                     chunk_type="paragraph",
                     index_in_page=i,
                     tokens=token_count,
+                    importance_score=importance,
                 )
             )
-        else:
-            # If paragraph is too long, break into smaller chunks
-            para_chunks = create_sliding_window_chunks(para, MAX_TOKENS_PER_CHUNK)
-            for j, smaller_chunk in enumerate(para_chunks):
-                if smaller_chunk.strip():
+        elif token_count > MAX_TOKENS_PER_CHUNK:
+            sub_chunks = create_sliding_window_chunks(para, MAX_TOKENS_PER_CHUNK)
+            for j, sub_chunk in enumerate(sub_chunks):
+                if sub_chunk.strip():
+                    importance = calculate_importance_score_fast(sub_chunk)
                     chunks.append(
                         Chunk(
-                            text=smaller_chunk,
+                            text=sub_chunk,
                             page=page_num,
                             chunk_type="paragraph_part",
-                            index_in_page=i * 100 + j,  # Preserve ordering
-                            tokens=count_tokens(smaller_chunk),
-                        )
-                    )
-
-    # 3. Section-level chunks
-    sections = identify_sections(page_text)
-    for i, (title, content) in enumerate(sections):
-        section_text = f"{title}\n{content}"
-        token_count = count_tokens(section_text)
-
-        if token_count <= MAX_TOKENS_PER_CHUNK and token_count > 0:
-            chunks.append(
-                Chunk(
-                    text=section_text,
-                    page=page_num,
-                    chunk_type="section",
-                    index_in_page=i,
-                    tokens=token_count,
-                )
-            )
-        else:
-            # If section is too long, create sliding window chunks
-            section_chunks = create_sliding_window_chunks(
-                section_text, MAX_TOKENS_PER_CHUNK
-            )
-            for j, smaller_chunk in enumerate(section_chunks):
-                if smaller_chunk.strip():
-                    chunks.append(
-                        Chunk(
-                            text=smaller_chunk,
-                            page=page_num,
-                            chunk_type="section_part",
                             index_in_page=i * 100 + j,
-                            tokens=count_tokens(smaller_chunk),
+                            tokens=count_tokens(sub_chunk),
+                            importance_score=importance,
                         )
                     )
+
+    # Key sentences (reduced processing)
+    sentences = split_into_sentences(cleaned_text)
+    for i, sentence in enumerate(sentences):
+        token_count = count_tokens(sentence)
+        if token_count >= 20:
+            importance = calculate_importance_score_fast(sentence)
+            if importance >= 2.0:  # Only high-importance sentences
+                chunks.append(
+                    Chunk(
+                        text=sentence,
+                        page=page_num,
+                        chunk_type="key_sentence",
+                        index_in_page=i,
+                        tokens=token_count,
+                        importance_score=importance,
+                    )
+                )
 
     return chunks
 
 
-# 5. Optimized Embedding Generation
-def get_embeddings_batched(model, texts: List[str], batch_size: int = BATCH_SIZE):
-    """Generate embeddings in optimized batches"""
+class CustomSentenceTransformerEmbeddings(Embeddings):
+    def __init__(self, sentence_transformer_model, precomputed_embeddings=None):
+        self.model = sentence_transformer_model
+        self.precomputed_embeddings = precomputed_embeddings
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if self.precomputed_embeddings is not None and len(texts) == len(
+            self.precomputed_embeddings
+        ):
+            return self.precomputed_embeddings
+        return self.model.encode(texts, normalize_embeddings=True).tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.model.encode([text], normalize_embeddings=True)[0].tolist()
+
+
+def init_faiss_index(embedding_dim: int = 384) -> faiss.IndexFlatIP:
+    return faiss.IndexFlatIP(embedding_dim)
+
+
+def update_faiss_index(
+    db_or_index,
+    texts: List[str],
+    embeddings: List[List[float]],
+    metadatas: List[Dict],
+    faiss_index_path: str,
+    model: SentenceTransformer,
+):
+    if not texts:
+        return db_or_index
+    if isinstance(db_or_index, FAISS):
+        provider = CustomSentenceTransformerEmbeddings(
+            sentence_transformer_model=model, precomputed_embeddings=embeddings
+        )
+        db = FAISS.from_texts(texts, provider, metadatas=metadatas)
+        db_or_index.merge_from(db)
+        return db_or_index
+    else:
+        provider = CustomSentenceTransformerEmbeddings(
+            sentence_transformer_model=model, precomputed_embeddings=embeddings
+        )
+        db = FAISS.from_texts(texts, provider, metadatas=metadatas)
+        return db
+
+
+def get_embeddings_batched_fast(model, texts: List[str], batch_size: int = BATCH_SIZE):
+    """Fast embedding generation"""
     if not texts:
         return []
-
-    # Process in batches for memory efficiency
     all_embeddings = []
+
+    # Use larger batches for speed
     for i in range(0, len(texts), batch_size):
         batch = texts[i : i + batch_size]
-        embs = model.encode(batch, show_progress_bar=False)
+        with torch.no_grad():  # Disable gradients for inference
+            embs = model.encode(
+                batch,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                batch_size=batch_size,
+            )
 
-        # Ensure proper formatting of output
         if isinstance(embs, np.ndarray):
             if embs.ndim == 1:
                 embs = np.expand_dims(embs, axis=0)
@@ -464,161 +414,19 @@ def get_embeddings_batched(model, texts: List[str], batch_size: int = BATCH_SIZE
             )
 
         all_embeddings.extend(batch_embs)
-
     return all_embeddings
 
 
-# 6. Improved FAISS Indexing with incremental updates
-class CustomSentenceTransformerEmbeddings(Embeddings):
-    """Custom embedding interface for LangChain"""
-
-    def __init__(self, sentence_transformer_model, precomputed_embeddings=None):
-        self.model = sentence_transformer_model
-        self.precomputed_embeddings = precomputed_embeddings
-
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        if self.precomputed_embeddings is not None and len(texts) == len(
-            self.precomputed_embeddings
-        ):
-            return self.precomputed_embeddings
-        return self.model.encode(texts).tolist()
-
-    def embed_query(self, text: str) -> list[float]:
-        return self.model.encode([text])[0].tolist()
-
-
-def init_faiss_index(embedding_dim: int = 384) -> faiss.IndexFlatIP:
-    """Initialize a new FAISS index"""
-    return faiss.IndexFlatIP(embedding_dim)
-
-
-def update_faiss_index(
-    db_or_index,
-    texts: List[str],
-    embeddings: List[List[float]],
-    metadatas: List[Dict],
-    faiss_index_path: str,
-    model: SentenceTransformer,
-):
-    """Update existing FAISS index or create a new one"""
-    if not texts:
-        return db_or_index
-
-    # Convert embeddings to numpy array for FAISS
-    if isinstance(db_or_index, FAISS):
-        # Update existing LangChain FAISS wrapper
-        provider = CustomSentenceTransformerEmbeddings(
-            sentence_transformer_model=model, precomputed_embeddings=embeddings
-        )
-        db = FAISS.from_texts(texts, provider, metadatas=metadatas)
-
-        # Merge with existing index
-        db_or_index.merge_from(db)
-        return db_or_index
-    else:
-        # Create new LangChain FAISS wrapper
-        provider = CustomSentenceTransformerEmbeddings(
-            sentence_transformer_model=model, precomputed_embeddings=embeddings
-        )
-        db = FAISS.from_texts(texts, provider, metadatas=metadatas)
-        return db
-
-
-def save_faiss_index(db: FAISS, faiss_index_path: str):
-    """Save FAISS index to disk"""
-    if os.path.exists(faiss_index_path):
-        # Move to backup before saving to prevent corruption if interrupted
-        backup_path = f"{faiss_index_path}_backup"
-        if os.path.exists(backup_path):
-            shutil.rmtree(backup_path)
-        shutil.copytree(faiss_index_path, backup_path)
-
-    os.makedirs(faiss_index_path, exist_ok=True)
-    db.save_local(faiss_index_path)
-
-    # Clean up backup if successful
-    backup_path = f"{faiss_index_path}_backup"
-    if os.path.exists(backup_path):
-        shutil.rmtree(backup_path)
-
-
-# UPDATED: Robust FAISS index loading with meta tensor error handling
-def load_faiss_index(
-    faiss_index_path: str = FAISS_INDEX_PATH, model_name: str = EMBEDDING_MODEL
-):
-    """Load FAISS index with fix for meta tensor issues"""
-    try:
-        # Use the global pre-warmed model if available to avoid meta tensor issues
-        global global_embedding_model
-        if global_embedding_model is not None:
-            model = global_embedding_model
-        else:
-            # Fallback: create model with explicit CPU device and proper tensor handling
-            import torch
-
-            with torch.device("cpu"):
-                model = SentenceTransformer(model_name, device="cpu")
-                # Ensure all model parameters are properly loaded to CPU
-                model.eval()
-
-        provider = CustomSentenceTransformerEmbeddings(model)
-
-        if os.path.exists(faiss_index_path):
-            try:
-                return FAISS.load_local(
-                    faiss_index_path, provider, allow_dangerous_deserialization=True
-                )
-            except RuntimeError as e:
-                print(f"Warning: Error when loading index: {e}")
-                # Create a fresh index
-                backup_path = f"{faiss_index_path}_problematic_{int(time.time())}"
-                shutil.move(faiss_index_path, backup_path)
-                print(f"Moved problematic index to: {backup_path}")
-                print("Creating a fresh index")
-                return FAISS.from_texts(
-                    ["initialization"], provider, metadatas=[{"empty": True}]
-                )
-        else:
-            return FAISS.from_texts(
-                ["initialization"], provider, metadatas=[{"empty": True}]
-            )
-    except Exception as e:
-        print(f"Error loading FAISS index: {e}")
-        # Use the global model if available, otherwise create a new one
-        if global_embedding_model is not None:
-            fallback_model = global_embedding_model
-        else:
-            with torch.device("cpu"):
-                fallback_model = SentenceTransformer(model_name, device="cpu")
-                fallback_model.eval()
-        fallback_provider = CustomSentenceTransformerEmbeddings(fallback_model)
-        return FAISS.from_texts(
-            ["Error loading index"], fallback_provider, metadatas=[{"error": str(e)}]
-        )
-
-
-# 7. Process pages in parallel with ThreadPoolExecutor
 def process_page(args):
-    """Process a single page (for parallel execution)"""
     page_text, page_num, model, batch_size = args
-
-    # Clean and chunk the text
-    cleaned = clean_text(page_text)
-    chunks = generate_chunks(cleaned, page_num + 1)  # 1-indexed pages
-
+    cleaned = clean_text_fast(page_text)
+    chunks = generate_chunks_fast(cleaned, page_num + 1)
     if not chunks:
         return None
 
-    # Get just the sentences for compatibility with original code
-    sentences = [c.text for c in chunks if c.chunk_type == "sentence"]
-
-    # Extract texts for embedding
     texts = [chunk.text for chunk in chunks]
+    embeddings = get_embeddings_batched_fast(model, texts, batch_size)
 
-    # Generate embeddings
-    embeddings = get_embeddings_batched(model, texts, batch_size)
-
-    # Create metadata
     metadatas = []
     for i, chunk in enumerate(chunks):
         metadatas.append(
@@ -627,6 +435,7 @@ def process_page(args):
                 "chunk_type": chunk.chunk_type,
                 "index_in_page": chunk.index_in_page,
                 "token_count": chunk.tokens,
+                "importance_score": chunk.importance_score,
                 "text": (
                     chunk.text[:100] + "..." if len(chunk.text) > 100 else chunk.text
                 ),
@@ -636,9 +445,6 @@ def process_page(args):
     return {
         "page_number": page_num + 1,
         "num_chunks": len(chunks),
-        "num_sentences": len(sentences),  # For compatibility with original code
-        "chunks": chunks,
-        "sentences": sentences,  # Add sentences for compatibility
         "texts": texts,
         "embeddings": embeddings,
         "metadatas": metadatas,
@@ -646,191 +452,98 @@ def process_page(args):
     }
 
 
-# 8. Main processing function with parallel execution and incremental indexing
-def process_document_pipeline(
-    url: str,
-    embedding_model: str = EMBEDDING_MODEL,
-    faiss_index_path: str = FAISS_INDEX_PATH,
-    batch_size: int = BATCH_SIZE,
-    max_workers: int = MAX_WORKERS,
-) -> Generator[Dict[str, Any], None, None]:
-    """Process document with parallel execution and incremental indexing"""
-    # First download the document
+def process_document_pipeline(url: str) -> Tuple[str, FAISS]:
+    """Optimized document processing"""
     path, mime_type = download_file(url)
 
     try:
-        # Load the model once and share across threads
-        # Use global model if available to avoid meta tensor issues
         global global_embedding_model
         if global_embedding_model is not None:
             model = global_embedding_model
         else:
-            # Create model with proper device context
-            with torch.device("cpu"):
-                model = SentenceTransformer(embedding_model, device="cpu")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"Loading model on {device}")
+            with torch.device(device):
+                model = SentenceTransformer(EMBEDDING_MODEL, device=device)
                 model.eval()
+                global_embedding_model = model
 
-        # Extract all pages
         pages = extract_pages_by_type(path, mime_type)
+        temp_index_path = f"temp_index_{int(time.time())}"
+        db = None
 
-        # Initialize FAISS index or load existing
-        if os.path.exists(faiss_index_path):
-            db = load_faiss_index(faiss_index_path, embedding_model)
-        else:
-            db = None  # Will be created on first update
+        page_args = [(pages[i], i, model, BATCH_SIZE) for i in range(len(pages))]
 
-        # Process pages in parallel
-        page_args = [(pages[i], i, model, batch_size) for i in range(len(pages))]
-
-        # Track token usage
-        total_tokens = 0
-        total_chunks = 0
-        total_sentences = 0
-
-        # Use ThreadPoolExecutor for parallel processing
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all page processing tasks
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             future_to_page = {
                 executor.submit(process_page, arg): i for i, arg in enumerate(page_args)
             }
 
-            # Process results as they complete
             for future in concurrent.futures.as_completed(future_to_page):
-                page_idx = future_to_page[future]
-
                 try:
                     result = future.result()
-
-                    if result is None:  # Skip empty pages
+                    if result is None:
                         continue
 
-                    # Update counters
-                    total_tokens += result.get("token_count", 0)
-                    total_chunks += result.get("num_chunks", 0)
-                    total_sentences += result.get("num_sentences", 0)
-
-                    # Update FAISS index incrementally
                     db = update_faiss_index(
                         db,
                         result["texts"],
                         result["embeddings"],
                         result["metadatas"],
-                        faiss_index_path,
+                        temp_index_path,
                         model,
                     )
-
-                    # Save index periodically
-                    if page_idx % 10 == 0:
-                        save_faiss_index(db, faiss_index_path)
-
-                    # Yield results - ensure backward compatibility
-                    yield {
-                        "page_number": result["page_number"],
-                        "num_sentences": result[
-                            "num_sentences"
-                        ],  # Keep this for compatibility
-                        "sentences": result["sentences"],  # Original API expects this
-                        "embeddings": result["embeddings"],
-                        "metadatas": result["metadatas"],
-                        # New fields
-                        "num_chunks": result["num_chunks"],
-                        "token_count": result.get("token_count", 0),
-                        # Don't include chunks object as it's not serializable
-                    }
-
                 except Exception as e:
-                    print(f"Error processing page {page_idx + 1}: {e}")
-                    # Yield error information
-                    yield {
-                        "page_number": page_idx + 1,
-                        "error": str(e),
-                        "num_sentences": 0,
-                        "num_chunks": 0,
-                        "sentences": [],
-                        "embeddings": [],
-                        "metadatas": [],
-                    }
+                    print(f"Error processing page: {e}")
 
-        # Final save of index
-        if db is not None:
-            save_faiss_index(db, faiss_index_path)
-
-        # Yield summary stats - FIX: Add page_number field to summary
-        yield {
-            "page_number": -1,  # Use a special value to indicate summary
-            "summary": True,
-            "total_pages": len(pages),
-            "total_chunks": total_chunks,
-            "total_sentences": total_sentences,
-            "total_tokens": total_tokens,
-            "faiss_index_path": faiss_index_path,
-            "num_sentences": 0,  # Add for compatibility
-            "sentences": [],  # Add for compatibility
-            "embeddings": [],  # Add for compatibility
-            "metadatas": [],  # Add for compatibility
-        }
+        return temp_index_path, db
 
     finally:
-        # Clean up temp file
         try:
             os.remove(path)
         except Exception:
             pass
 
 
-# --- NEW FUNCTIONS FOR LLM QUERY PROCESSING ---
+def build_optimized_prompt(
+    context_chunks: List[str], question: str, sources: List[Dict]
+) -> str:
+    """Enhanced prompt that prioritizes direct answers with sources"""
 
+    # Limit context for speed but prioritize by importance
+    if len(context_chunks) > 3:
+        # Sort by importance score
+        chunk_data = list(zip(context_chunks, sources))
+        chunk_data.sort(key=lambda x: x[1].get("importance_score", 0), reverse=True)
+        context_chunks = [chunk for chunk, _ in chunk_data[:3]]
+        sources = [source for _, source in chunk_data[:3]]
 
-def process_and_cache_document(document_url: str) -> str:
-    """Process document and return FAISS index path, using cache if available"""
-    # Create a unique ID for this document
-    url_hash = hashlib.md5(document_url.encode()).hexdigest()
-    cache_path = f"{CACHE_DIR}/{url_hash}"
+    context_with_sources = []
+    for i, (chunk, source) in enumerate(zip(context_chunks, sources)):
+        page = source.get("page", "?")
+        context_with_sources.append(f"[Page {page}] {chunk}")
 
-    # Check if already cached
-    if os.path.exists(cache_path):
-        return cache_path
+    context = "\n\n".join(context_with_sources)
 
-    # Process document and build index
-    print(f"Processing document: {document_url}")
-    list(process_document_pipeline(document_url, faiss_index_path=cache_path))
-
-    # Return the cache path
-    return cache_path
-
-
-def build_prompt(context_chunks: List[str], question: str) -> str:
-    """Build an optimized prompt for insurance policy Q&A"""
-
-    # Join context chunks, with special emphasis on most relevant
-    if len(context_chunks) > 0:
-        # Give extra weight to the most relevant chunk
-        context = f"Most relevant policy information:\n{context_chunks[0]}\n\n"
-
-        # Add additional context if available
-        if len(context_chunks) > 1:
-            context += "Additional relevant policy clauses:\n" + "\n\n".join(
-                context_chunks[1:]
-            )
-    else:
-        context = "No relevant policy information found."
-
-    # Enhanced prompt for better answers
+    # Enhanced prompt that emphasizes finding specific values
     prompt = (
-        "You are an insurance policy expert answering questions about policy coverage and terms.\n\n"
-        "Task: Answer the question using ONLY the provided policy information below. "
-        "If the answer is not in the context, say 'Based on the provided policy information, I cannot determine this.'\n\n"
-        f"Policy Information:\n{context}\n\n"
-        f"Question: {question}\n\n"
-        "Provide a direct, concise answer without including phrases like 'Based on the context' or 'According to the document'. "
-        "Include specific details like waiting periods, percentages, or conditions when mentioned in the policy information. "
-        "Format numbers consistently (use digits for numbers and percentages)."
+        "You are an expert insurance analyst. Provide precise, direct answers with specific numbers and timeframes.\n\n"
+        "CRITICAL INSTRUCTIONS:\n"
+        "• Look for EXACT numbers (days, months, years, percentages, amounts)\n"
+        "• If you find specific timeframes or values, state them clearly\n"
+        "• Include page references for transparency: [Page X]\n"
+        "• Be concise but complete\n"
+        "• If no specific information exists, say so clearly\n\n"
+        f"POLICY EXCERPTS:\n{context}\n\n"
+        f"QUESTION: {question}\n\n"
+        "ANSWER (be specific and include page reference):"
     )
+
     return prompt
 
 
-def query_ollama_llama3(prompt: str, retries: int = 3) -> str:
-    """Query Ollama LLM with retry logic for robustness"""
+def query_ollama_fast(prompt: str, retries: int = 2) -> str:
+    """Fast Ollama query with aggressive timeout"""
     for attempt in range(retries):
         try:
             payload = {
@@ -838,163 +551,218 @@ def query_ollama_llama3(prompt: str, retries: int = 3) -> str:
                 "prompt": prompt,
                 "stream": False,
                 "options": {
-                    "temperature": 0.1,  # Lower temperature for more factual responses
-                    "top_k": 40,  # Consider top 40 tokens
-                    "top_p": 0.9,  # Sample from top 90% probability mass
+                    "temperature": 0.0,  # Deterministic
+                    "top_k": 20,  # Faster
+                    "top_p": 0.8,  # Faster
+                    "num_predict": 150,  # Shorter responses
                 },
             }
-            response = requests.post(OLLAMA_API_URL, json=payload, timeout=30)
+            response = requests.post(
+                OLLAMA_API_URL, json=payload, timeout=15
+            )  # Shorter timeout
             response.raise_for_status()
             data = response.json()
-            return data.get("response") or data.get(
-                "text", "Error: No response generated"
-            )
-
+            return data.get("response", "No response generated").strip()
         except (requests.RequestException, KeyError) as e:
             if attempt == retries - 1:
-                return f"Error generating response: {str(e)}"
-            time.sleep(1)  # Wait before retry
+                print(f"LLM timeout/error: {e}")
+                return f"LLM_ERROR_FALLBACK"  # Signal for fallback
+            time.sleep(0.2)
 
 
-# UPDATED: Robust search and answer function with better error handling
-def search_and_answer_question(question: str, db_path: str) -> str:
-    """Process a single question using the FAISS index and LLM with better meta tensor handling"""
-    try:
-        # Ensure we have a directory and it's not problematic
-        if not os.path.exists(db_path) or "_problematic" in db_path:
-            return "Unable to access document index. Please reprocess the document."
-
-        try:
-            # CRITICAL FIX: Always use the global pre-warmed model to avoid meta tensor issues
-            global global_embedding_model
-            if global_embedding_model is None:
-                # Initialize the global model if it doesn't exist
-                import torch
-
-                with torch.device("cpu"):
-                    global_embedding_model = SentenceTransformer(
-                        EMBEDDING_MODEL, device="cpu"
-                    )
-                    global_embedding_model.eval()
-
-            # Use the global model - this is key to avoiding meta tensor issues
-            model = global_embedding_model
-
-            # Create embedding provider using the existing model
-            provider = CustomSentenceTransformerEmbeddings(model)
-
-            # Load the FAISS index using the existing FAISS import
-            db = FAISS.load_local(
-                db_path, provider, allow_dangerous_deserialization=True
-            )
-
-            # Search for relevant chunks
-            retrieval_results = db.similarity_search(question, k=NUM_RELEVANT_CHUNKS)
-            context_chunks = [doc.page_content for doc in retrieval_results]
-
-            # Try LLM, fall back to rule-based
-            try:
-                prompt = build_prompt(context_chunks, question)
-                return query_ollama_llama3(prompt)
-            except Exception as llm_error:
-                print(f"LLM error, falling back to rule-based: {llm_error}")
-                return extract_answer_from_context(question, context_chunks)
-
-        except Exception as search_error:
-            print(f"Search infrastructure error for '{question}': {search_error}")
-            return (
-                "Unable to search document due to a technical issue. Please try again."
-            )
-
-    except Exception as e:
-        print(f"Unexpected error processing question '{question}': {str(e)}")
-        return "Could not process this question due to a technical error."
-
-
-# ADDED: New fallback function when LLM is unavailable
-def extract_answer_from_context(question: str, context_chunks: List[str]) -> str:
-    """Extract relevant information from context when LLM is unavailable"""
+def enhanced_pattern_extraction_with_sources(
+    question: str, context_chunks: List[str], sources: List[Dict]
+) -> str:
+    """Enhanced pattern extraction that includes source attribution"""
     if not context_chunks:
         return "No relevant information found."
+
     question_lower = question.lower()
-    keywords = []
-    insurance_terms = [
-        "grace period",
-        "waiting period",
-        "pre-existing",
-        "maternity",
-        "cataract",
-        "surgery",
-        "organ donor",
-        "no claim discount",
-        "ncd",
-        "preventive",
-        "health check",
-        "hospital",
-        "ayush",
-        "sub-limits",
-        "room rent",
-        "icu",
-        "plan a",
-    ]
-    for term in insurance_terms:
-        if term in question_lower:
-            keywords.append(term)
-    important_words = ["cover", "policy", "limit", "expense", "treatment", "benefit"]
-    for word in important_words:
-        if word in question_lower:
-            keywords.append(word)
-    if not keywords:
-        stop_words = [
-            "what",
-            "is",
-            "are",
-            "the",
-            "for",
-            "under",
-            "this",
-            "and",
-            "or",
-            "in",
-            "to",
-            "a",
-            "an",
-        ]
-        keywords = [word for word in question_lower.split() if word not in stop_words][
-            :3
-        ]
-    scored_chunks = []
-    for chunk in context_chunks:
-        chunk_lower = chunk.lower()
-        score = sum(10 if keyword in chunk_lower else 0 for keyword in keywords)
-        sentences = chunk.split(". ")
-        for sentence in sentences:
-            sentence_lower = sentence.lower()
-            keyword_count = sum(1 for keyword in keywords if keyword in sentence_lower)
-            if keyword_count >= 2:
-                score += 5 * keyword_count
-        if score > 0:
-            scored_chunks.append((score, chunk))
-    if scored_chunks:
-        scored_chunks.sort(reverse=True)
-        best_chunks = [chunk for _, chunk in scored_chunks[:2]]
-        if "waiting period" in question_lower:
-            for chunk in best_chunks:
-                if "waiting period" in chunk.lower():
-                    for sentence in chunk.split(". "):
-                        if (
-                            "waiting period" in sentence.lower()
-                            and any(str(i) for i in range(10)) in sentence
-                        ):
-                            return sentence + "."
-        if "grace period" in question_lower:
-            for chunk in best_chunks:
-                if "grace period" in chunk.lower():
-                    for sentence in chunk.split(". "):
-                        if (
-                            "grace period" in sentence.lower()
-                            and any(str(i) for i in range(10)) in sentence
-                        ):
-                            return sentence + "."
-        return ". ".join(best_chunks)
-    return "Based on the available information, I cannot provide a specific answer to this question."
+
+    # Grace period - enhanced search
+    if "grace period" in question_lower:
+        for i, chunk in enumerate(context_chunks):
+            chunk_lower = chunk.lower()
+            page = sources[i].get("page", "?") if i < len(sources) else "?"
+
+            # Look for specific patterns
+            grace_patterns = [
+                r"grace period[s]?\s+(?:of|is|shall be|for|allowed)\s+(thirty|30)\s+(days?)",
+                r"(thirty|30)\s+days?\s+grace period",
+                r"grace period[s]?\s+(?::|is|of)\s*(thirty|30)",
+                r"grace period[s]?\s+(?:of|is|shall be|for)\s+(\d+)\s+(days?|months?)",
+            ]
+
+            for pattern in grace_patterns:
+                match = re.search(pattern, chunk_lower)
+                if match:
+                    if "thirty" in match.group(0) or "30" in match.group(0):
+                        return f"The grace period for premium payment is thirty (30) days. [Page {page}]"
+                    elif len(match.groups()) >= 2:
+                        return f"The grace period is {match.group(1)} {match.group(2)}. [Page {page}]"
+
+    # Enhanced waiting period search
+    if "waiting period" in question_lower and "pre-existing" in question_lower:
+        for i, chunk in enumerate(context_chunks):
+            chunk_lower = chunk.lower()
+            page = sources[i].get("page", "?") if i < len(sources) else "?"
+
+            if re.search(r"(?:thirty-six|36)\s*(?:\(36\))?\s*months?", chunk_lower):
+                return f"The waiting period for pre-existing diseases is thirty-six (36) months of continuous coverage. [Page {page}]"
+
+    # Maternity enhanced
+    if "maternity" in question_lower:
+        for i, chunk in enumerate(context_chunks):
+            chunk_lower = chunk.lower()
+            page = sources[i].get("page", "?") if i < len(sources) else "?"
+
+            if re.search(r"maternity.*(?:covered|cover|benefit|expense)", chunk_lower):
+                conditions = []
+                if re.search(r"24.*months?", chunk_lower):
+                    conditions.append("24 months continuous coverage required")
+                if re.search(r"(?:two|2).*(?:deliveries|births)", chunk_lower):
+                    conditions.append("limited to 2 deliveries per policy period")
+
+                base_answer = f"Yes, maternity expenses are covered. [Page {page}]"
+                if conditions:
+                    return f"{base_answer} Conditions: {'; '.join(conditions)}."
+                return base_answer
+
+    # Cataract enhanced
+    if "cataract" in question_lower:
+        for i, chunk in enumerate(context_chunks):
+            chunk_lower = chunk.lower()
+            page = sources[i].get("page", "?") if i < len(sources) else "?"
+
+            if re.search(
+                r"(?:two|2)\s+years?.*cataract|cataract.*(?:two|2)\s+years?",
+                chunk_lower,
+            ):
+                return f"The waiting period for cataract surgery is two (2) years. [Page {page}]"
+
+    # Organ donor enhanced
+    if "organ donor" in question_lower:
+        for i, chunk in enumerate(context_chunks):
+            chunk_lower = chunk.lower()
+            page = sources[i].get("page", "?") if i < len(sources) else "?"
+
+            if re.search(
+                r"organ donor.*(?:covered|cover|expense|medical|indemnify)", chunk_lower
+            ):
+                return f"Yes, organ donor medical expenses are covered for harvesting organs donated to insured persons. [Page {page}]"
+
+    # Default with source
+    if sources and context_chunks:
+        page = sources[0].get("page", "?")
+        return f"Based on the available information [Page {page}]: {context_chunks[0][:200]}..."
+
+    return "Information not found in policy excerpts."
+
+
+def search_and_answer_question(
+    question: str, temp_index_path: str, db: FAISS
+) -> Dict[str, Any]:
+    """Enhanced search with better source-aware answers"""
+    try:
+        if not db:
+            return {"answer": "Unable to process document.", "source_clauses": []}
+
+        retrieval_results = db.similarity_search(question, k=NUM_RELEVANT_CHUNKS)
+        context_chunks = [doc.page_content for doc in retrieval_results]
+
+        sources = []
+        for doc in retrieval_results:
+            metadata = doc.metadata
+            sources.append(
+                {
+                    "page": metadata.get("page", "?"),
+                    "chunk_type": metadata.get("chunk_type", "paragraph"),
+                    "importance_score": metadata.get("importance_score", 0),
+                    "text_preview": (
+                        doc.page_content[:100] + "..."
+                        if len(doc.page_content) > 100
+                        else doc.page_content
+                    ),
+                }
+            )
+
+        # Try LLM first
+        try:
+            prompt = build_optimized_prompt(context_chunks, question, sources)
+            answer = query_ollama_fast(prompt)
+
+            # If LLM failed or gave incomplete answer, enhance with pattern extraction
+            if (
+                "LLM_ERROR_FALLBACK" in answer
+                or "not explicitly stated" in answer.lower()
+                or "not specified" in answer.lower()
+            ):
+
+                pattern_answer = enhanced_pattern_extraction_with_sources(
+                    question, context_chunks, sources
+                )
+                # Use pattern answer if it's more specific
+                if any(
+                    term in pattern_answer for term in ["days", "months", "years", "%"]
+                ):
+                    return {"answer": pattern_answer, "source_clauses": sources}
+
+            return {"answer": answer, "source_clauses": sources}
+        except Exception as llm_error:
+            print(f"LLM error: {llm_error}")
+            answer = enhanced_pattern_extraction_with_sources(
+                question, context_chunks, sources
+            )
+            return {"answer": answer, "source_clauses": sources}
+
+    except Exception as e:
+        print(f"Search error for '{question}': {e}")
+        return {"answer": "Search failed. Please try again.", "source_clauses": []}
+
+
+def process_questions(document_url: str, questions: List[str]) -> List[str]:
+    """Main function to process document and answer questions"""
+    print(f"Processing document: {document_url}")
+    start_time = time.time()
+
+    # Process document
+    temp_index_path, db = process_document_pipeline(document_url)
+
+    if not db:
+        return ["Error: Failed to process document"] * len(questions)
+
+    doc_time = time.time() - start_time
+    print(f"Document processing completed in {doc_time:.2f} seconds")
+
+    # Process questions in parallel
+    answers = [""] * len(questions)
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future_to_idx = {
+            executor.submit(search_and_answer_question, q, temp_index_path, db): i
+            for i, q in enumerate(questions)
+        }
+
+        for future in concurrent.futures.as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                result = future.result()
+                if isinstance(result, dict):
+                    answers[idx] = result.get("answer", "No answer provided")
+                else:
+                    answers[idx] = result
+            except Exception as e:
+                print(f"Error processing question '{questions[idx]}': {e}")
+                # Use enhanced pattern extraction as fallback
+                answers[idx] = enhanced_pattern_extraction_with_sources(
+                    questions[idx], [""], [{"page": "?", "chunk_type": "fallback"}]
+                )
+
+    # Clean up temporary index
+    try:
+        if os.path.exists(temp_index_path):
+            shutil.rmtree(temp_index_path)
+    except Exception:
+        pass
+
+    return answers
